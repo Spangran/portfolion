@@ -1,0 +1,996 @@
+# PortfoliON — To-Do / Work Items Migration Guide (TB_ACTIVITIES → TB_WORKITEMS)
+
+This single document contains **everything you need** to migrate the To-Do UI from `TB_ACTIVITIES` to the new `TB_WORKITEMS` design. It includes:
+
+* Exact SQL for the required **views**
+* Exact PL/SQL for **APEX AJAX callbacks**
+* The complete **UMD JavaScript** widget (no build tools)
+* Step-by-step **APEX page setup**
+* Optional **data migration** SQL
+
+> Assumptions
+>
+> * Oracle APEX 24.2 (works for 21.x+ with minor UI differences).
+> * Global page item `P0_TENANCY_ID` exists.
+> * Global page item `P0_PERSON_ID` exists (your “current person”).
+> * You’ll render this UI on **Page 50** (change the page number anywhere if needed).
+> * `T_COMMENTS.reference_type` remains **'Action'**.
+> * Statuses for work items live in `TB_LOV` with `TYPE='WORK_STATUS'` and include a **Done** row.
+
+---
+
+## 0) Page Items (create if missing)
+
+Create **Hidden** page items on P50:
+
+* `P50_LIST_ID` — numeric, current real list id (blank for virtual lists)
+* `P50_VL` — varchar2, current **virtual** list key (MYDAY, IMPORTANT, PLANNED, ASSIGNED, OPEN)
+* `P50_Q` — varchar2, search text
+* `P50_TASK_ID` — numeric, used by “Mark done”
+
+Global items (already present):
+
+* `P0_TENANCY_ID` — numeric
+* `P0_PERSON_ID` — numeric (used for “Assigned to me”)
+
+---
+
+## 1) Views (create or replace)
+
+### 1.1 `V_TODO_ITEMS` (from TB_WORKITEMS)
+
+```sql
+CREATE OR REPLACE VIEW v_todo_items AS
+select
+  wi.tenancy_id,
+  wi.id,
+  wi.list_id          as todo_list_id,
+  wi.project_id,
+  wi.parent_id,
+  wi.name,
+  wi.description,
+  /* derive status text from LOV; fall back to value */
+  upper(nvl(s.display_value, s.value)) as status,
+  /* normalize priority to LOW/MEDIUM/HIGH/CRITICAL (or your chosen values) */
+  upper(nvl(wi.priority,'LOW'))        as priority,
+  wi.due_date                          as due_dt,
+  wi.assignee_id,
+  wi.created_on,
+  wi.created_by
+from tb_workitems wi
+left join tb_lov s
+  on s.id = wi.status_id
+ and s.tenancy_id = wi.tenancy_id
+where wi.work_type in ('TODO', 'KANBAN');
+```
+
+
+
+### 1.2 `V_TODO_LISTS` (over TB_LISTS)
+
+> If you already have a working lists view, you can keep it. Otherwise:
+
+```sql
+CREATE OR REPLACE VIEW v_todo_lists AS
+select
+  l.tenancy_id,
+  l.id,
+  l.name,
+  /* optional column(s): if you have SCOPE or TYPE, keep it for icon hints */
+  upper(nvl(l.scope, null)) as scope,
+  l.project_id,
+  l.sort_order,
+  nvl(l.is_archived,0) as is_archived
+from tb_lists l
+where nvl(l.is_archived,0) = 0;
+```
+
+* If `SCOPE` does not exist in your `TB_LISTS`, the view compiles with `scope` as NULL.
+* The navigation process (below) gracefully defaults the icon when `scope` is NULL.
+
+---
+
+## 2) APEX Page 50: AJAX Callback Processes
+
+Create **three** processes on Page 50 with Type = **AJAX Callback (PL/SQL)**.
+
+### 2.1 `TODO_GET_NAV`
+
+declare
+  l_myday     number;
+  l_important number;
+  l_planned   number;
+  l_assigned  number;
+  l_open      number;
+  l_unsorted      number;
+begin
+  -- My Day
+  select count(*) into l_myday
+    from tb_workitems wi
+   where wi.tenancy_id = :P0_TENANCY_ID
+     and wi.work_type  in ('TODO', 'KANBAN')
+     and trunc(wi.due_date) = trunc(sysdate)
+     and not exists (
+           select 1 from tb_lov s
+            where s.id = wi.status_id
+              and s.tenancy_id = wi.tenancy_id
+              and upper(nvl(s.display_value, s.value)) = 'DONE'
+         );
+
+  -- Important
+  select count(*) into l_important
+    from tb_workitems wi
+   where wi.tenancy_id = :P0_TENANCY_ID
+     and wi.work_type  in ('TODO', 'KANBAN')
+     and upper(nvl(wi.priority,'LOW')) in ('HIGH','CRITICAL')
+     and not exists (
+           select 1 from tb_lov s
+            where s.id = wi.status_id
+              and s.tenancy_id = wi.tenancy_id
+              and upper(nvl(s.display_value, s.value)) = 'DONE'
+         );
+
+  -- Planned
+  select count(*) into l_planned
+    from tb_workitems wi
+   where wi.tenancy_id = :P0_TENANCY_ID
+     and wi.work_type  in ('TODO', 'KANBAN')
+     and wi.due_date is not null
+     and not exists (
+           select 1 from tb_lov s
+            where s.id = wi.status_id
+              and s.tenancy_id = wi.tenancy_id
+              and upper(nvl(s.display_value, s.value)) = 'DONE'
+         );
+
+  -- Assigned to me  (FIXED: tenancy_id spelling)
+  select count(*) into l_assigned
+    from tb_workitems wi
+   where wi.tenancy_id = :P0_TENANCY_ID
+     and wi.work_type  in ('TODO', 'KANBAN')
+     and wi.assignee_id = :P0_PERSON_ID
+     and not exists (
+           select 1 from tb_lov s
+            where s.id = wi.status_id
+              and s.tenancy_id = wi.tenancy_id
+              and upper(nvl(s.display_value, s.value)) = 'DONE'
+         );
+
+  -- Open
+  select count(*) into l_open
+    from tb_workitems wi
+   where wi.tenancy_id = :P0_TENANCY_ID
+     and wi.work_type  in ('TODO', 'KANBAN')
+     and not exists (
+           select 1 from tb_lov s
+            where s.id = wi.status_id
+              and s.tenancy_id = wi.tenancy_id
+              and upper(nvl(s.display_value, s.value)) = 'DONE'
+         );
+
+-- Unsorted (list_id is null, created by me)
+select count(*) into l_unsorted
+  from tb_workitems wi
+ where wi.tenancy_id = :P0_TENANCY_ID
+   and wi.work_type in ('TODO','KANBAN')
+   and wi.list_id is null
+   and wi.created_by = nvl(wwv_flow.g_user, user);
+
+
+  apex_json.open_object;
+  apex_json.open_array('items');
+
+  -- Virtual lists
+  apex_json.open_object; apex_json.write('key','MYDAY');     apex_json.write('label','My Day');        apex_json.write('icon','calendar'); apex_json.write('badge',l_myday);     apex_json.write('divider',false); apex_json.close_object;
+  apex_json.open_object; apex_json.write('key','IMPORTANT'); apex_json.write('label','Important');     apex_json.write('icon','flag');     apex_json.write('badge',l_important); apex_json.write('divider',false); apex_json.close_object;
+  apex_json.open_object; apex_json.write('key','PLANNED');   apex_json.write('label','Planned');       apex_json.write('icon','calendar'); apex_json.write('badge',l_planned);   apex_json.write('divider',false); apex_json.close_object;
+  apex_json.open_object; apex_json.write('key','ASSIGNED');  apex_json.write('label','Assigned to me');apex_json.write('icon','user');     apex_json.write('badge',l_assigned);  apex_json.write('divider',false); apex_json.close_object;
+  apex_json.open_object; apex_json.write('key','OPEN');      apex_json.write('label','Open');          apex_json.write('icon','circle');   apex_json.write('badge',l_open);      apex_json.write('divider',false); apex_json.close_object;
+apex_json.open_object; apex_json.write('key','UNSORTED'); apex_json.write('label','Unsorted'); apex_json.write('icon','inbox'); apex_json.write('badge',l_unsorted); apex_json.write('divider',false); apex_json.close_object;
+
+  -- Divider
+  apex_json.open_object; apex_json.write('key','DIV'); apex_json.write('divider',true); apex_json.close_object;
+
+  -- Real lists (match your IS_ARCHIVED type; see note)
+  for r in (
+    with counts as (
+      select wi.list_id, count(*) cnt
+        from tb_workitems wi
+        left join tb_lov s on s.id = wi.status_id and s.tenancy_id = wi.tenancy_id
+       where wi.tenancy_id = :P0_TENANCY_ID
+         and wi.work_type  in ('TODO', 'KANBAN')
+         and upper(nvl(s.display_value, s.value)) <> 'DONE'
+       group by wi.list_id
+    )
+    select l.id,
+           l.name,
+           case upper(nvl(l.scope,'')) when 'PROJECT' then 'folder'
+                                        when 'SHARED'  then 'users'
+                                        else 'user' end as icon,
+           nvl(c.cnt,0) as badge
+      from v_todo_lists l
+      left join counts c on c.list_id = l.id
+     where l.tenancy_id = :P0_TENANCY_ID
+       -- If TB_LISTS.IS_ARCHIVED is CHAR('Y'/'N'): use l.is_archived = 'N'
+       -- If it's numeric(0/1): use NVL(l.is_archived,0) = 0
+       and l.is_archived = 'N'
+     order by nvl(l.sort_order,9999), upper(l.name)
+  ) loop
+    apex_json.open_object;
+    apex_json.write('key',    r.id);
+    apex_json.write('label',  r.name);
+    apex_json.write('icon',   r.icon);
+    apex_json.write('badge',  r.badge);
+    apex_json.write('divider',false);
+    apex_json.close_object;
+  end loop;
+
+  apex_json.close_array;
+  apex_json.close_object;
+end;
+
+```
+
+> If you got `ORA-00904: "L"."TYPE"`, this version removes any reference to `l.type`.
+
+### 2.2 `TODO_GET_TASKS`
+
+```plsql
+begin
+  apex_json.open_object;
+  apex_json.open_array('rows');
+
+  for t in (
+    select
+      wi.id,
+      wi.name,
+      wi.description,
+      upper(nvl(wi.priority,'LOW')) as priority,
+      upper(nvl(s.display_value, s.value)) as status,
+      wi.due_date as due_dt,
+      wi.assignee_id,
+      wi.project_id,
+      -- assignee display name
+      (select p.first_name || ' ' || p.surname
+         from tb_people p
+        where p.id = wi.assignee_id
+          and p.tenancy_id = wi.tenancy_id) as assignee_name,
+      -- comment count (keep reference_type='Action')
+      (select count(*)
+         from t_comments c
+        where c.tenancy_id   = wi.tenancy_id
+          and c.reference_id = wi.id
+          and c.reference_type = 'Action') as comments
+    from tb_workitems wi
+    left join tb_lov s
+      on s.id = wi.status_id
+     and s.tenancy_id = wi.tenancy_id
+    where wi.tenancy_id = :P0_TENANCY_ID
+      and wi.work_type  in ('TODO', 'KANBAN')
+      and (
+            (:P50_VL is null and wi.list_id = :P50_LIST_ID)
+         or (:P50_VL = 'MYDAY'     and trunc(wi.due_date) = trunc(sysdate))
+         or (:P50_VL = 'PLANNED'   and wi.due_date is not null)
+         or (:P50_VL = 'OPEN'      and upper(nvl(s.display_value, s.value)) <> 'DONE')
+         or (:P50_VL = 'ASSIGNED'  and wi.assignee_id = :P0_PERSON_ID)
+         or (:P50_VL = 'IMPORTANT' and upper(nvl(wi.priority,'LOW')) in ('HIGH','CRITICAL'))
+          )
+      and ( :P50_Q is null
+            or lower(wi.name||' '||nvl(wi.description,'')) like '%'||lower(:P50_Q)||'%' )
+    order by
+      case upper(nvl(wi.priority,'LOW'))
+        when 'CRITICAL' then 1
+        when 'HIGH'     then 2
+        when 'MEDIUM'   then 3
+        else 4
+      end,
+      nvl(wi.due_date, date '2100-01-01')
+  ) loop
+    apex_json.open_object;
+    apex_json.write('id',          t.id);
+    apex_json.write('title',       t.name);
+    apex_json.write('description', nvl(t.description,''));
+    apex_json.write('priority',    t.priority);
+    apex_json.write('status',      t.status);
+    apex_json.write(
+      'due',
+      case when t.due_dt is not null
+           then to_char(t.due_dt,'YYYY-MM-DD"T"HH24:MI:SS')
+           else null
+      end
+    );
+    apex_json.write('assignee',    nvl(t.assignee_name,''));
+    apex_json.write('projectId',   t.project_id);
+    apex_json.write('comments',    nvl(t.comments,0));
+    apex_json.close_object;
+  end loop;
+
+  apex_json.close_array;
+  apex_json.close_object;
+end;
+```
+
+### 2.3 `TODO_COMPLETE`
+
+```plsql
+declare
+  l_done_id tb_lov.id%type;
+begin
+  -- find LOV row for DONE in your WORK_STATUS type
+  select id into l_done_id
+    from tb_lov
+   where tenancy_id = :P0_TENANCY_ID
+     and upper(type) = 'WORK_STATUS'
+     and upper(nvl(display_value, value)) = 'DONE'
+     and rownum = 1;
+
+  update tb_workitems
+     set status_id = l_done_id
+   where tenancy_id = :P0_TENANCY_ID
+     and id         = :P50_TASK_ID
+     and work_type  = 'TODO';
+
+  apex_json.open_object; apex_json.write('updated', sql%rowcount); apex_json.close_object;
+exception
+  when no_data_found then
+    apex_json.open_object; apex_json.write('error','DONE status not found in TB_LOV (WORK_STATUS)'); apex_json.close_object;
+end;
+```
+
+> If you prefer not to error when DONE is missing, default `l_done_id` to NULL and allow the update to do nothing.
+
+
+
+### 2.4 'TODO_CREATE,
+
+declare
+  l_id tb_workitems.id%type;
+  l_name varchar2(500) := apex_json.get_varchar2('name');
+  l_list number := apex_json.get_number('listId'); -- may be null
+  l_sort number;
+begin
+  if l_name is null then
+    apex_error.add_error(p_message => 'Task name is required', p_display_location => apex_error.c_inline_in_notification);
+    apex_json.open_object; apex_json.write('error','Name required'); apex_json.close_object;
+    return;
+  end if;
+
+  -- next sort_order within the target list (or null list bucket)
+  select nvl(max(sort_order),0)+1 into l_sort
+  from tb_workitems
+  where tenancy_id = :P0_TENANCY_ID
+    and nvl(list_id, -1) = nvl(l_list, -1);
+
+  insert into tb_workitems(
+    tenancy_id, work_type, name, list_id, assignee_id, sort_order, created_by
+  ) values (
+    :P0_TENANCY_ID, 'TODO', l_name, l_list, :P0_PERSON_ID, l_sort, nvl(wwv_flow.g_user, user)
+  )
+  returning id into l_id;
+
+  apex_json.open_object; apex_json.write('id', l_id); apex_json.close_object;
+end;
+
+
+
+### TODO_CREATE_LIST
+
+declare
+  l_id tb_lists.id%type;
+  l_name varchar2(200) := apex_json.get_varchar2('name');
+  l_scope varchar2(20) := nvl(apex_json.get_varchar2('scope'), 'PERSONAL');
+  l_sort number;
+begin
+  if l_name is null then
+    apex_json.open_object; apex_json.write('error','List name required'); apex_json.close_object; return;
+  end if;
+
+  select nvl(max(sort_order),0)+1 into l_sort
+  from tb_lists
+  where tenancy_id = :P0_TENANCY_ID
+    and kind in ('TODO','KANBAN');
+
+  insert into tb_lists(
+    name, kind, scope, project_id, owner_id, is_archived, icon, color, sort_order, created_date, created_by, tenancy_id
+  ) values (
+    l_name, 'TODO', l_scope, null, :P0_PERSON_ID, 'N', null, null, l_sort, sysdate, :P0_PERSON_ID, :P0_TENANCY_ID
+  )
+  returning id into l_id;
+
+  apex_json.open_object; apex_json.write('id', l_id); apex_json.close_object;
+end;
+
+
+
+---
+
+## 3) UMD JavaScript (single file, no build tools)
+
+Upload this file to **Shared Components → Static Application Files** as `portfolion_todo_apex_umd.js`:
+
+```javascript
+// PortfoliON To-Do (APEX UMD Build) — v1.0
+// Renders the To-Do UI and calls APEX AJAX callbacks:
+//   TODO_GET_NAV, TODO_GET_TASKS, TODO_COMPLETE
+// Requires page items: P0_TENANCY_ID, P0_PERSON_ID, P50_LIST_ID, P50_VL, P50_Q, P50_TASK_ID
+
+(function(){
+  function loadScript(src){return new Promise(function(res, rej){var s=document.createElement('script');s.src=src;s.async=true;s.onload=res;s.onerror=rej;document.head.appendChild(s);});}
+  function ensureLibs(){
+    var chain = Promise.resolve();
+    if (!window.preact){ chain = chain.then(function(){ return loadScript('https://unpkg.com/preact@10.19.3/dist/preact.umd.js'); }); }
+    if (!window.preactHooks){ chain = chain.then(function(){ return loadScript('https://unpkg.com/preact@10.19.3/hooks/dist/hooks.umd.js'); }); }
+    if (!window.htm){ chain = chain.then(function(){ return loadScript('https://unpkg.com/htm@3.1.1/dist/htm.umd.js'); }); }
+    return chain;
+  }
+
+  function injectCSS(){
+    if (document.getElementById('pf-todo-css')) return;
+    var css = [
+      ':root{--pf-border:#e5e7eb;--pf-accent:#4f46e5;--pf-muted:#64748b}',
+      '.pf-wrap{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica Neue,Arial;color:#111827}',
+      '.pf-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}',
+      '.pf-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:20px}',
+      '.pf-chip{background:#eef2ff;color:#3730a3;padding:2px 8px;border-radius:999px;font-size:12px}',
+      '.pf-grid{display:grid;grid-template-columns:280px 1fr;gap:16px}',
+      '.pf-card{background:#fff;border:1px solid var(--pf-border);border-radius:14px}',
+      '.pf-card-section{padding:12px}',
+      '.pf-list{display:flex;flex-direction:column;gap:2px}',
+      '.pf-list-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;cursor:pointer}',
+      '.pf-list-item:hover{background:#f3f4f6}.pf-list-item.active{background:#eef2ff;font-weight:600}',
+      '.pf-badge{margin-left:auto;background:#e5e7eb;color:#334155;border-radius:999px;padding:2px 8px;font-size:12px}',
+      '.pf-divider{height:1px;background:var(--pf-border);margin:6px 0 8px}',
+      '.pf-slicers{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}',
+      '.pf-slicer{background:#fff;border:1px solid var(--pf-border);border-radius:14px;padding:10px;display:flex;align-items:center;gap:10px}',
+      '.pf-slicer .pf-value{font-size:22px;font-weight:700}',
+      '.pf-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}',
+      '.pf-input{border:1px solid var(--pf-border);border-radius:10px;padding:7px 10px;min-width:240px}',
+      '.pf-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--pf-border);background:#fff;cursor:pointer;font-size:13px}',
+      '.pf-btn.primary{background:var(--pf-accent);border-color:var(--pf-accent);color:#fff}',
+      '.pf-tasks{background:#fff;border:1px solid var(--pf-border);border-radius:14px;overflow:hidden;margin-top:10px}',
+      '.pf-task{padding:12px;border-top:1px solid var(--pf-border)}.pf-task:first-child{border-top:0}',
+      '.pf-task-line{display:flex;align-items:start;gap:10px}',
+      '.pf-title-click{font-weight:600;cursor:pointer}',
+      '.pf-meta{margin-left:auto;display:flex;gap:12px;color:var(--pf-muted);font-size:12px}',
+      '.pf-dot{width:10px;height:10px;border-radius:999px;border:3px solid #cbd5e1;margin-top:3px}',
+      '.pf-task-details{padding-left:24px;color:#374151;font-size:13px}',
+      '.pf-actions{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}',
+      '.pf-pill{background:#f3f4f6;border-radius:999px;padding:2px 8px;font-size:12px;display:inline-flex;align-items:center;gap:6px}',
+      '@media (max-width:1100px){.pf-grid{grid-template-columns:1fr}}'
+    ].join('');
+    var el=document.createElement('style'); el.id='pf-todo-css'; el.textContent=css; document.head.appendChild(el);
+  }
+
+function apexCall(name){
+  return new Promise(function(resolve,reject){
+    if(!window.apex || !apex.server || !apex.server.process){
+      reject('APEX not available'); return;
+    }
+    apex.server.process(
+      name,
+      { pageItems: '#P0_TENANCY_ID,#P0_PERSON_ID,#P50_LIST_ID,#P50_VL,#P50_Q,#P50_TASK_ID' },
+      { dataType:'json' }
+    ).then(resolve).catch(reject);
+  });
+}
+
+
+
+
+
+  function setItem(n,v){ if(window.apex&&apex.item(n)){ apex.item(n).setValue(v==null?'':v); } }
+  var iconMap={ calendar:'📅', flag:'⚑', user:'👤', circle:'◯', folder:'📁', users:'👥' };
+
+  function createApp(){
+    var h=preact.h, html=htm.bind(h), hooks=preactHooks;
+    function PriorityDot(p){ var c=p==='CRITICAL'?'#dc2626':p==='HIGH'?'#f59e0b':p==='MEDIUM'?'#3b82f6':'#cbd5e1'; return html`<span class="pf-dot" style=${'border-color:'+c}></span>`; }
+    function Slicer(p){ return html`<div class="pf-slicer"><span>${p.icon}</span><div><div style="color:var(--pf-muted);font-size:12px">${p.title}</div><div class="pf-value">${p.value}</div></div></div>`; }
+    function sameDay(a,b){ return a&&b&&a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate(); }
+
+    function App(opts){
+      var useState=hooks.useState, useEffect=hooks.useEffect;
+      var _a=useState('MYDAY'), active=_a[0], setActive=_a[1];
+      var _b=useState(''), search=_b[0], setSearch=_b[1];
+      var _c=useState([]), nav=_c[0], setNav=_c[1];
+      var _d=useState([]), rows=_d[0], setRows=_d[1];
+      var _e=useState({}), expanded=_e[0], setExpanded=_e[1];
+
+      useEffect(function(){
+        apexCall('TODO_GET_NAV').then(function(data){
+          var items=(data&&data.items)||[]; setNav(items);
+          var vl=(window.apex&&apex.item('P50_VL'))?apex.item('P50_VL').getValue():''; 
+          var lid=(window.apex&&apex.item('P50_LIST_ID'))?apex.item('P50_LIST_ID').getValue():'';
+          if(vl){ setActive(vl); }
+          else if(lid){ setActive(String(lid)); }
+          else{ var firstReal=items.find(function(i){return !i.divider && !isNaN(+i.key);}); setActive(firstReal?String(firstReal.key):'MYDAY'); }
+        }).catch(console.error);
+      }, []);
+
+      useEffect(function(){
+        var isVirtual=isNaN(+active);
+        setItem('P50_VL',isVirtual?active:'');
+        setItem('P50_LIST_ID',isVirtual?'':active);
+        setItem('P50_Q',search);
+        apexCall('TODO_GET_TASKS').then(function(data){
+          var r=(data&&data.rows)||[]; r.forEach(function(t){ t.due=t.due?new Date(t.due):null; }); setRows(r);
+        }).catch(console.error);
+      }, [active,search]);
+
+      function countForKey(k){ var it=nav.find(function(i){return String(i.key)===String(k);}); return it&&it.badge!=null?it.badge:null; }
+      var dueToday = rows.filter(function(t){ return t.due && sameDay(t.due, new Date()); }).length;
+      var overdue  = rows.filter(function(t){ return t.due && t.due < new Date() && t.status!=='DONE'; }).length;
+      var openCt   = rows.filter(function(t){ return t.status!=='DONE'; }).length;
+      var doneCt   = rows.filter(function(t){ return t.status==='DONE'; }).length;
+
+      return html`<div class="pf-wrap">
+        <div class="pf-header">
+          <div class="pf-title"><span>To-Do Lists</span><span class="pf-chip">TB_WORKITEMS</span></div>
+          <div><button class="pf-btn">🔔 Digest</button><button class="pf-btn primary" style="margin-left:6px">＋ New task</button></div>
+        </div>
+
+        <div class="pf-grid">
+          <div class="pf-card"><div class="pf-card-section"><div class="pf-list">
+            ${nav.length===0?html`<div style="color:var(--pf-muted);font-size:12px">Loading…</div>`:
+              nav.map(function(i){
+                if(i.divider) return html`<div class="pf-divider"></div>`;
+                var act=(String(active)===String(i.key))?' active':'';
+                var badge=countForKey(i.key);
+                return html`<div class=${'pf-list-item'+act} onClick=${function(){ setActive(String(i.key)); }}>
+                  <span>${iconMap[i.icon]||''}</span>
+                  <span>${i.label||''}</span>
+                  ${badge?html`<span class="pf-badge">${badge}</span>`:null}
+                </div>`;
+              })
+            }
+          </div></div></div>
+
+          <div>
+            <div class="pf-slicers">
+              ${Slicer({title:'Due Today', value:dueToday, icon:'📅'})}
+              ${Slicer({title:'Overdue', value:overdue, icon:'⚑'})}
+              ${Slicer({title:'Open', value:openCt, icon:'◯'})}
+              ${Slicer({title:'Done', value:doneCt, icon:'✓'})}
+            </div>
+
+            <div class="pf-card" style="margin-top:10px"><div class="pf-card-section pf-toolbar">
+              <input class="pf-input" placeholder="Search title, description…" value=${search} onInput=${function(e){ setSearch(e.currentTarget.value); }} />
+              <button class="pf-btn">Filters</button>
+              <button class="pf-btn">Sort</button>
+              <button class="pf-btn">Quick add</button>
+            </div></div>
+
+            <div class="pf-tasks">
+              ${rows.length===0?html`<div class="pf-card-section" style="color:var(--pf-muted)">No tasks match your filters.</div>` :
+                rows.map(function(t){
+                  return html`<div class="pf-task"><div class="pf-task-line">
+                    ${PriorityDot(t.priority)}
+                    <div style="flex:1">
+                      <div><span class="pf-title-click" onClick=${function(){ var n=Object.assign({},expanded); n[t.id]=!expanded[t.id]; setExpanded(n); }}>${t.title}</span></div>
+                      ${expanded[t.id]?html`<div class="pf-task-details">
+                        <div>${t.description||''}</div>
+                        <div class="pf-actions">
+                          ${t.projectId?html`<span class="pf-pill">📁 ${t.projectId}</span>`:null}
+                          <span class="pf-pill">👤 ${t.assignee||''}</span>
+                          ${t.due?html`<span class="pf-pill">📅 ${t.due.toLocaleDateString()}</span>`:null}
+                          <button class="pf-btn" onClick=${function(){
+                            setItem('P50_TASK_ID', t.id);
+                            apexCall('TODO_COMPLETE').then(function(){
+                              return Promise.all([apexCall('TODO_GET_NAV'), apexCall('TODO_GET_TASKS')]);
+                            }).then(function(res){
+                              setNav((res[0]&&res[0].items)||[]);
+                              var r=(res[1]&&res[1].rows)||[]; r.forEach(function(x){ x.due=x.due?new Date(x.due):null; }); setRows(r);
+                            }).catch(console.error);
+                          }}>Mark done</button>
+                          <button class="pf-btn" onClick=${function(){
+                            var url = apex.util.makeApplicationUrl({
+                              page: 347,
+                              values: { P347_ID:t.id, P347_REFERENCE_ID:t.id, P347_REFERENCE_TYPE:'Action' }
+                            });
+                            apex.navigation.redirect(url);
+                          }}>Edit</button>
+                        </div>
+                      </div>`:null}
+                    </div>
+                    <div class="pf-meta">
+                      ${t.projectId?html`<span>📁 ${t.projectId}</span>`:null}
+                      <span>👤 ${t.assignee||''}</span>
+                      ${t.due?html`<span>📅 ${t.due.toLocaleDateString()}</span>`:null}
+                      <span>💬 ${t.comments||0}</span>
+                    </div>
+                  </div></div>`;
+                })
+              }
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+    return { App: App };
+  }
+
+  function mount(containerId, options){
+    injectCSS();
+    var root=document.getElementById(containerId);
+    var C=createApp().App;
+    preact.render(preact.h(C, options||{}), root);
+  }
+
+  window.PortfolionTodo = {
+    mount: function(containerId, options){
+      ensureLibs().then(function(){ mount(containerId, options); });
+    }
+  };
+})();
+```
+
+---
+
+## 4) APEX Page 50 — include & mount the JS
+
+1. **Upload** the JS file (above) to **Shared Components → Static Application Files**.
+   Name: `portfolion_todo_apex_umd.js`
+
+2. On **Page 50**, open **Page → JavaScript → File URLs** and add:
+
+```
+#APP_FILES#portfolion_todo_apex_umd#MIN#.js
+```
+
+3. Add a **Static Content** region with this HTML:
+
+```html
+<div id="todo-root" style="min-height:640px"></div>
+```
+
+4. **Execute when Page Loads** (Page 50):
+
+```javascript
+(function mountWhenReady(){
+  if (window.PortfolionTodo && window.PortfolionTodo.mount) {
+    window.PortfolionTodo.mount('todo-root', {});
+  } else {
+    setTimeout(mountWhenReady, 30);
+  }
+})();
+```
+
+> The widget will call the three AJAX processes and read/write `P50_LIST_ID`, `P50_VL`, `P50_Q`, `P50_TASK_ID` automatically.
+
+---
+
+
+## 6) Notes / Gotchas
+
+* If your `TB_LISTS` table **does not** have a `SCOPE` column, the nav icons will default to **'user'**. That’s fine; it’s purely visual.
+* **“Assigned to me”** uses `:P0_PERSON_ID` everywhere.
+* **Status** is controlled by `TB_LOV` (`TYPE='WORK_STATUS'`). Ensure there is a **Done** row.
+* **Comments** continue to use `T_COMMENTS` with `reference_type='Action'` and `reference_id = TB_WORKITEMS.ID`.
+* The UMD script loads Preact + Hooks + htm from **unpkg** via simple `<script>` tags—no module/CSP headaches.
+
+---
+
+## 7) Smoke test
+
+1. Open Page 50.
+2. The left nav should show virtual lists (with counts) and your real lists (with badges).
+3. Clicking a nav item should refresh results.
+4. Search filters results live.
+5. “Mark done” updates `TB_WORKITEMS.STATUS_ID` to the **Done** LOV and refreshes the nav + list.
+6. “Edit” redirects to page 347 with `P347_ID`, `P347_REFERENCE_ID`, `P347_REFERENCE_TYPE='Action'`.
+
+If anything errors, copy the exact error and the process name—it’s usually a missing LOV or a list mapping tweak.
+
+
+
+Supporting DDL references
+
+  CREATE OR REPLACE FORCE EDITIONABLE VIEW "V_TODO_ITEMS" ("TENANCY_ID", "ID", "TODO_LIST_ID", "PROJECT_ID", "PARENT_ID", "NAME", "DESCRIPTION", "STATUS", "PRIORITY", "DUE_DT", "ASSIGNEE_ID", "CREATED_ON", "CREATED_BY") AS 
+  select
+  wi.tenancy_id,
+  wi.id,
+  wi.list_id          as todo_list_id,
+  wi.project_id,
+  wi.parent_id,
+  wi.name,
+  wi.description,
+  /* derive status text from LOV */
+  upper(nvl(s.display_value, s.value)) as status,
+  /* normalize priority to LOW/MEDIUM/HIGH/CRITICAL (or whatever you store) */
+  upper(nvl(wi.priority,'LOW'))        as priority,
+  wi.due_date                          as due_dt,
+  wi.assignee_id,
+  wi.created_on,
+  wi.created_by
+from tb_workitems wi
+left join tb_lov s
+  on s.id = wi.status_id
+ and s.tenancy_id = wi.tenancy_id
+where wi.work_type IN ('TODO' , 'KANBAN');
+
+  CREATE OR REPLACE FORCE EDITIONABLE VIEW "V_TODO_LISTS" ("TENANCY_ID", "ID", "NAME", "SCOPE", "PROJECT_ID", "OWNER_ID", "IS_ARCHIVED", "ICON", "COLOR", "SORT_ORDER") AS 
+  select tenancy_id, id, name, scope, project_id, owner_id, is_archived, icon, color, sort_order
+  from tb_lists
+ where kind in ('TODO', 'KANBAN')
+   and is_archived = 'N';
+
+  CREATE TABLE "TB_WORKITEMS" 
+   (	"ID" NUMBER GENERATED BY DEFAULT AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  NOT NULL ENABLE, 
+	"TENANCY_ID" NUMBER NOT NULL ENABLE, 
+	"PROJECT_ID" NUMBER, 
+	"LIST_ID" NUMBER, 
+	"PARENT_ID" NUMBER, 
+	"WORK_TYPE" VARCHAR2(20) NOT NULL ENABLE, 
+	"NAME" VARCHAR2(500) NOT NULL ENABLE, 
+	"DESCRIPTION" CLOB, 
+	"STATUS_ID" NUMBER, 
+	"KANBAN_COL_ID" NUMBER, 
+	"PRIORITY" VARCHAR2(50), 
+	"DUE_DATE" DATE, 
+	"ASSIGNEE_ID" NUMBER, 
+	"SORT_ORDER" NUMBER, 
+	"TAGS" VARCHAR2(4000), 
+	"C_TEXT_1" VARCHAR2(4000), 
+	"C_TEXT_2" VARCHAR2(4000), 
+	"C_TEXT_3" VARCHAR2(4000), 
+	"C_TEXT_4" VARCHAR2(4000), 
+	"C_TEXT_5" VARCHAR2(4000), 
+	"C_TEXT_6" VARCHAR2(4000), 
+	"C_TEXT_7" VARCHAR2(4000), 
+	"C_TEXT_8" VARCHAR2(4000), 
+	"C_TEXT_9" VARCHAR2(4000), 
+	"C_TEXT_10" VARCHAR2(4000), 
+	"C_DATE_1" DATE, 
+	"C_DATE_2" DATE, 
+	"C_DATE_3" DATE, 
+	"C_DATE_4" DATE, 
+	"C_DATE_5" DATE, 
+	"C_NUM_1" NUMBER, 
+	"C_NUM_2" NUMBER, 
+	"C_NUM_3" NUMBER, 
+	"C_NUM_4" NUMBER, 
+	"C_NUM_5" NUMBER, 
+	"CREATED_BY" VARCHAR2(500), 
+	"CREATED_ON" DATE, 
+	"UPDATED_BY" VARCHAR2(500), 
+	"UPDATED_ON" DATE, 
+	 PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+   ) ;
+
+  ALTER TABLE "TB_WORKITEMS" ADD CONSTRAINT "TB_WI_FK_TEN" FOREIGN KEY ("TENANCY_ID")
+	  REFERENCES "TB_TENANTS" ("ID") ON DELETE CASCADE ENABLE;
+  ALTER TABLE "TB_WORKITEMS" ADD CONSTRAINT "TB_WI_FK_PROJ" FOREIGN KEY ("PROJECT_ID")
+	  REFERENCES "TB_PROJECTS" ("ID") ON DELETE CASCADE ENABLE;
+  ALTER TABLE "TB_WORKITEMS" ADD CONSTRAINT "TB_WI_FK_LIST" FOREIGN KEY ("LIST_ID")
+	  REFERENCES "TB_LISTS" ("ID") ON DELETE CASCADE ENABLE;
+  ALTER TABLE "TB_WORKITEMS" ADD CONSTRAINT "TB_WI_FK_ASSIGNEE" FOREIGN KEY ("ASSIGNEE_ID")
+	  REFERENCES "TB_PEOPLE" ("ID") ON DELETE SET NULL ENABLE;
+  ALTER TABLE "TB_WORKITEMS" ADD CONSTRAINT "TB_WI_FK_STATUS" FOREIGN KEY ("STATUS_ID")
+	  REFERENCES "TB_LOV" ("ID") ENABLE;
+
+  CREATE INDEX "TB_WI_ASSIGNEE_ID_IDX" ON "TB_WORKITEMS" ("ASSIGNEE_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_KCOL_ID_IDX" ON "TB_WORKITEMS" ("KANBAN_COL_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_LIST_ID_IDX" ON "TB_WORKITEMS" ("LIST_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_PROJECT_ID_IDX" ON "TB_WORKITEMS" ("PROJECT_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_SORT_IDX" ON "TB_WORKITEMS" ("LIST_ID", "KANBAN_COL_ID", "SORT_ORDER") 
+  ;
+
+  CREATE INDEX "TB_WI_STATUS_ID_IDX" ON "TB_WORKITEMS" ("STATUS_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_TENANCY_ID_IDX" ON "TB_WORKITEMS" ("TENANCY_ID") 
+  ;
+
+  CREATE INDEX "TB_WI_TYPE_IDX" ON "TB_WORKITEMS" ("WORK_TYPE") 
+  ;
+
+  CREATE OR REPLACE EDITIONABLE TRIGGER "TB_WORKITEMS_BIU_AUD" 
+BEFORE INSERT OR UPDATE ON TB_WORKITEMS 
+FOR EACH ROW 
+DECLARE 
+  l_user VARCHAR2(500) := NVL(wwv_flow.g_user, USER); 
+BEGIN 
+  IF INSERTING THEN 
+    :NEW.created_on := SYSDATE; 
+    :NEW.created_by := l_user; 
+  ELSE 
+    :NEW.updated_on := SYSDATE; 
+    :NEW.updated_by := l_user; 
+  END IF; 
+END;
+/
+ALTER TRIGGER "TB_WORKITEMS_BIU_AUD" ENABLE;
+  CREATE OR REPLACE EDITIONABLE TRIGGER "TB_WI_BI_CHECK_KCOL" 
+BEFORE INSERT OR UPDATE OF kanban_col_id, list_id ON TB_WORKITEMS 
+FOR EACH ROW 
+DECLARE 
+  l_cnt NUMBER; 
+BEGIN 
+  IF :NEW.kanban_col_id IS NOT NULL THEN 
+    SELECT COUNT(*) INTO l_cnt 
+    FROM TB_LIST_KANBAN_COLS 
+    WHERE id = :NEW.kanban_col_id 
+      AND list_id = :NEW.list_id 
+      AND is_active = 1; 
+    IF l_cnt = 0 THEN 
+      RAISE_APPLICATION_ERROR(-20031, 
+        'Kanban column must belong to the same list and be active.'); 
+    END IF; 
+  END IF; 
+END;
+/
+ALTER TRIGGER "TB_WI_BI_CHECK_KCOL" ENABLE;
+
+  CREATE TABLE "TB_LISTS" 
+   (	"ID" NUMBER GENERATED ALWAYS AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 20 NOORDER  NOCYCLE  NOKEEP  NOSCALE  NOT NULL ENABLE, 
+	"NAME" VARCHAR2(200) NOT NULL ENABLE, 
+	"KIND" VARCHAR2(20) NOT NULL ENABLE, 
+	"SCOPE" VARCHAR2(20) NOT NULL ENABLE, 
+	"PROJECT_ID" NUMBER, 
+	"OWNER_ID" NUMBER NOT NULL ENABLE, 
+	"IS_ARCHIVED" CHAR(1) DEFAULT 'N' NOT NULL ENABLE, 
+	"ICON" VARCHAR2(50), 
+	"COLOR" VARCHAR2(30), 
+	"SORT_ORDER" NUMBER, 
+	"CREATED_DATE" DATE DEFAULT sysdate NOT NULL ENABLE, 
+	"CREATED_BY" NUMBER, 
+	"TENANCY_ID" NUMBER NOT NULL ENABLE, 
+	 CHECK (is_archived in ('Y','N')) ENABLE, 
+	 PRIMARY KEY ("ID")
+  USING INDEX  ENABLE, 
+	 CONSTRAINT "CHK_LISTS_KIND" CHECK (kind in ('TODO','KANBAN','CHECKLIST','NOTE')) ENABLE, 
+	 CONSTRAINT "CHK_LISTS_SCOPE" CHECK (scope in ('PERSONAL','PROJECT','SHARED')) ENABLE
+   ) ;
+
+  CREATE INDEX "IX_LISTS_CORE" ON "TB_LISTS" ("TENANCY_ID", "KIND", "SCOPE", "PROJECT_ID", "OWNER_ID", "IS_ARCHIVED") 
+  ;
+
+  CREATE INDEX "IX_LISTS_SORT" ON "TB_LISTS" ("TENANCY_ID", "PROJECT_ID", "SORT_ORDER") 
+  ;
+
+  CREATE OR REPLACE EDITIONABLE TRIGGER "TB_LISTS_AI_KANBAN_DEFAULTS" 
+after insert on TB_LISTS
+for each row
+declare
+  l_inserted pls_integer := 0;
+begin
+  -- Only for Kanban lists
+  if :new.kind <> 'KANBAN' then
+    return;
+  end if;
+
+  -- Try to seed from tenancy templates in one set-based insert
+  insert into TB_LIST_KANBAN_COLS
+        (tenancy_id, list_id, name, display_order, wip_limit, color_hex, icon, is_default)
+  select :new.tenancy_id,
+         :new.id,
+         t.name,
+         -- generate a sensible order if template display_order is null
+         coalesce(t.display_order, rn * 10) as display_order,
+         t.wip_limit,
+         t.color_hex,
+         t.icon,
+         1
+  from (
+    select tt.*,
+           row_number() over (order by nvl(tt.display_order, 1), tt.name) rn
+    from   TB_KANBAN_COLUMN_TEMPLATES tt
+    where  tt.tenancy_id = :new.tenancy_id
+    and    tt.is_active  = 1
+  ) t;
+
+  l_inserted := sql%rowcount;
+
+  -- Fallback: if no templates, create basic 3 columns
+  if l_inserted = 0 then
+    insert into TB_LIST_KANBAN_COLS
+      (tenancy_id, list_id, name, display_order, wip_limit, color_hex, icon, is_default)
+    values
+      (:new.tenancy_id, :new.id, 'To-Do',       10, null, '#c6a235', null, 1);
+
+    insert into TB_LIST_KANBAN_COLS
+      (tenancy_id, list_id, name, display_order, wip_limit, color_hex, icon, is_default)
+    values
+      (:new.tenancy_id, :new.id, 'In-Progress', 20, null, '#f1a4a4', null, 1);
+
+    insert into TB_LIST_KANBAN_COLS
+      (tenancy_id, list_id, name, display_order, wip_limit, color_hex, icon, is_default)
+    values
+      (:new.tenancy_id, :new.id, 'Done',        30, null, '#58f09f', null, 1);
+  end if;
+end;
+/
+ALTER TRIGGER "TB_LISTS_AI_KANBAN_DEFAULTS" ENABLE;
+
+
+  CREATE TABLE "TB_LOV" 
+   (	"ID" NUMBER GENERATED BY DEFAULT ON NULL AS IDENTITY MINVALUE 1 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 17469 NOCACHE  ORDER  NOCYCLE  NOKEEP  NOSCALE  NOT NULL ENABLE, 
+	"TYPE" VARCHAR2(50), 
+	"VALUE" VARCHAR2(50), 
+	"PARENT_TYPE" VARCHAR2(4000), 
+	"DISPLAY_VALUE" VARCHAR2(350), 
+	"TENANCY_ID" NUMBER, 
+	"DISPLAY_ORDER" NUMBER, 
+	"ENABLED" NUMBER(1,0) DEFAULT 1, 
+	"PROJECT_ID" NUMBER, 
+	"KANBAN_YN" VARCHAR2(1) DEFAULT 'Y', 
+	"REPORT_YN" VARCHAR2(1) DEFAULT 'Y', 
+	"EFFORT_YN" VARCHAR2(1) DEFAULT 'Y', 
+	"ICON" VARCHAR2(100), 
+	"ESCALATE_YN" VARCHAR2(1), 
+	"PROJECT_STATUS" VARCHAR2(10), 
+	"ESTIMATE_EFFORT" NUMBER, 
+	"CUSTOM_LIST_FIELD_ID" NUMBER, 
+	"AUD_CREATED_BY" VARCHAR2(500), 
+	"AUD_CREATED_ON" DATE, 
+	"AUD_UPDATED_BY" VARCHAR2(500), 
+	"AUD_UPDATED_ON" DATE, 
+	"ASSIGNEE_PROMPT" VARCHAR2(1), 
+	 PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+   ) ;
+
+  ALTER TABLE "TB_LOV" ADD CONSTRAINT "TB_LOV_FK3" FOREIGN KEY ("TYPE")
+	  REFERENCES "TB_LOV_TYPE" ("NAME") ON DELETE CASCADE DISABLE;
+  ALTER TABLE "TB_LOV" ADD CONSTRAINT "TB_LOV_FK2" FOREIGN KEY ("PROJECT_ID")
+	  REFERENCES "TB_PROJECTS" ("ID") ON DELETE CASCADE ENABLE;
+  ALTER TABLE "TB_LOV" ADD CONSTRAINT "TB_LOV_FK1" FOREIGN KEY ("TENANCY_ID")
+	  REFERENCES "TB_TENANTS" ("ID") ON DELETE CASCADE DISABLE;
+  ALTER TABLE "TB_LOV" ADD CONSTRAINT "TB_LOV_FK4" FOREIGN KEY ("CUSTOM_LIST_FIELD_ID")
+	  REFERENCES "TB_CUSTOM_LIST_FIELDS" ("ID") ON DELETE CASCADE ENABLE;
+
+  CREATE INDEX "TB_LOV_CUSTOM_LIST_FIELD_ID_IDX" ON "TB_LOV" ("CUSTOM_LIST_FIELD_ID") 
+  ;
+
+  CREATE INDEX "TB_LOV_PROJECT_ID_IDX" ON "TB_LOV" ("PROJECT_ID") 
+  ;
+
+  CREATE INDEX "TB_LOV_TENANCY_ID_IDX" ON "TB_LOV" ("TENANCY_ID") 
+  ;
+
+  CREATE INDEX "TB_LOV_TYPE_IDX" ON "TB_LOV" ("TYPE") 
+  ;
+
+  CREATE OR REPLACE EDITIONABLE TRIGGER "TB_LOV_BIU_AUD" 
+before insert or update on TB_LOV
+for each row
+declare
+  l_user varchar2(500) := nvl(wwv_flow.g_user,user);
+begin  
+  if inserting then
+    :new.aud_created_by := l_user;
+    :new.aud_created_on := sysdate;
+  elsif updating then
+    :new.aud_updated_by := l_user;
+    :new.aud_updated_on := sysdate;
+  end if;
+end;
+
+
+
+
+/
+ALTER TRIGGER "TB_LOV_BIU_AUD" ENABLE;
+  CREATE OR REPLACE EDITIONABLE TRIGGER "TB_LOV_AI" 
+BEFORE INSERT ON TB_LOV 
+FOR EACH ROW 
+BEGIN
+  IF :NEW.DISPLAY_VALUE IS NOT NULL AND :NEW.VALUE IS NULL THEN
+    :NEW.VALUE := :NEW.DISPLAY_VALUE;
+  END IF;
+END;
+
+
+
+/
+ALTER TRIGGER "TB_LOV_AI" ENABLE;
+
+

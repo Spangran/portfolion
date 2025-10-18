@@ -1,0 +1,374 @@
+// PortfoliON To‑Do (APEX UMD Build) — v1.0
+(function(){
+  function loadScript(src){return new Promise(function(res, rej){var s=document.createElement('script');s.src=src;s.async=true;s.onload=res;s.onerror=rej;document.head.appendChild(s);});}
+  function ensureLibs(){
+    var chain = Promise.resolve();
+    if (!window.preact){ chain = chain.then(function(){ return loadScript('https://unpkg.com/preact@10.19.3/dist/preact.umd.js'); }); }
+    if (!window.preactHooks){ chain = chain.then(function(){ return loadScript('https://unpkg.com/preact@10.19.3/hooks/dist/hooks.umd.js'); }); }
+    if (!window.htm){ chain = chain.then(function(){ return loadScript('https://unpkg.com/htm@3.1.1/dist/htm.umd.js'); }); }
+    return chain;
+  }
+  function injectCSS(){
+    if (document.getElementById('pf-todo-css')) return;
+    var css=[
+      ':root{--pf-border:#e5e7eb;--pf-accent:#4f46e5;--pf-muted:#64748b}',
+      '.pf-wrap{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica Neue,Arial;color:#111827}',
+      '.pf-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}',
+      '.pf-title{display:flex;align-items:center;gap:8px;font-weight:600;font-size:20px}',
+      '.pf-chip{background:#eef2ff;color:#3730a3;padding:2px 8px;border-radius:999px;font-size:12px}',
+      '.pf-grid{display:grid;grid-template-columns:280px 1fr;gap:16px}',
+      '.pf-card{background:#fff;border:1px solid var(--pf-border);border-radius:14px}',
+      '.pf-card-section{padding:12px}',
+      '.pf-list{display:flex;flex-direction:column;gap:2px}',
+      '.pf-list-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;cursor:pointer}',
+      '.pf-list-item:hover{background:#f3f4f6}.pf-list-item.active{background:#eef2ff;font-weight:600}',
+      '.pf-badge{margin-left:auto;background:#e5e7eb;color:#334155;border-radius:999px;padding:2px 8px;font-size:12px}',
+      '.pf-divider{height:1px;background:var(--pf-border);margin:6px 0 8px}',
+      '.pf-slicers{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}',
+      '.pf-slicer{background:#fff;border:1px solid var(--pf-border);border-radius:14px;padding:10px;display:flex;align-items:center;gap:10px}',
+      '.pf-slicer .pf-value{font-size:22px;font-weight:700}',
+      '.pf-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}',
+      '.pf-input{border:1px solid var(--pf-border);border-radius:10px;padding:7px 10px;min-width:240px}',
+      '.pf-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--pf-border);background:#fff;cursor:pointer;font-size:13px}',
+      '.pf-btn.primary{background:var(--pf-accent);border-color:var(--pf-accent);color:#fff}',
+      '.pf-tasks{background:#fff;border:1px solid var(--pf-border);border-radius:14px;overflow:hidden;margin-top:10px}',
+      '.pf-task{padding:12px;border-top:1px solid var(--pf-border)}.pf-task:first-child{border-top:0}',
+      '.pf-task-line{display:flex;align-items:start;gap:10px}',
+      '.pf-title-click{font-weight:600;cursor:pointer}',
+      '.pf-meta{margin-left:auto;display:flex;gap:12px;color:var(--pf-muted);font-size:12px}',
+      '.pf-dot{width:10px;height:10px;border-radius:999px;border:3px solid #cbd5e1;margin-top:3px}',
+      '.pf-task-details{padding-left:24px;color:#374151;font-size:13px}',
+      '.pf-actions{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}',
+      '.pf-pill{background:#f3f4f6;border-radius:999px;padding:2px 8px;font-size:12px;display:inline-flex;align-items:center;gap:6px}',
+      '@media (max-width:1100px){.pf-grid{grid-template-columns:1fr}}'
+    ].join('');
+    var el=document.createElement('style'); el.id='pf-todo-css'; el.textContent=css; document.head.appendChild(el);
+  }
+  function apexCall(name){
+    return new Promise(function(resolve,reject){
+      if(!window.apex||!apex.server||!apex.server.process){reject('APEX not available');return;}
+      apex.server.process(name,{pageItems:'#P0_TENANCY_ID,P50_LIST_ID,P50_VL,P50_Q,P50_TASK_ID#'},{dataType:'json'}).then(resolve).catch(reject);
+    });
+  }
+  function setItem(n,v){ if(window.apex&&apex.item(n)){ apex.item(n).setValue(v==null?'':v); } }
+  var iconMap={ calendar:'📅', flag:'⚑', user:'👤', circle:'◯', folder:'📁', users:'👥' };
+
+  function createApp(){
+    var h=preact.h, html=htm.bind(h), hooks=preactHooks;
+    function PriorityDot(p){ var c=p==='CRITICAL'?'#dc2626':p==='HIGH'?'#f59e0b':p==='MEDIUM'?'#3b82f6':'#cbd5e1'; return html`<span class="pf-dot" style=${'border-color:'+c}></span>`; }
+    function Slicer(p){ return html`<div class="pf-slicer"><span>${p.icon}</span><div><div style="color:var(--pf-muted);font-size:12px">${p.title}</div><div class="pf-value">${p.value}</div></div></div>`; }
+    function sameDay(a,b){ return a&&b&&a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate(); }
+
+    function App(opts){
+      var useState=hooks.useState, useEffect=hooks.useEffect;
+      var _a=useState('MYDAY'), active=_a[0], setActive=_a[1];
+      var _b=useState(''), search=_b[0], setSearch=_b[1];
+      var _c=useState([]), nav=_c[0], setNav=_c[1];
+      var _d=useState([]), rows=_d[0], setRows=_d[1];
+      var _e=useState({}), expanded=_e[0], setExpanded=_e[1];
+
+      useEffect(function(){
+        apexCall('TODO_GET_NAV').then(function(data){
+          var items=(data&&data.items)||[]; setNav(items);
+          var vl=(window.apex&&apex.item('P50_VL'))?apex.item('P50_VL').getValue():'';
+          var lid=(window.apex&&apex.item('P50_LIST_ID'))?apex.item('P50_LIST_ID').getValue():'';
+          if(vl){ setActive(vl); }
+          else if(lid){ setActive(String(lid)); }
+          else{ var firstReal=items.find(function(i){return !i.divider && !isNaN(+i.key);}); setActive(firstReal?String(firstReal.key):'MYDAY'); }
+        }).catch(console.error);
+      }, []);
+
+      useEffect(function(){
+        var isVirtual=isNaN(+active);
+        setItem('P50_VL',isVirtual?active:'');
+        setItem('P50_LIST_ID',isVirtual?'':active);
+        setItem('P50_Q',search);
+        apexCall('TODO_GET_TASKS').then(function(data){
+          var r=(data&&data.rows)||[]; r.forEach(function(t){ t.due=t.due?new Date(t.due):null; }); setRows(r);
+        }).catch(console.error);
+      }, [active,search]);
+
+
+
+useEffect(function(){
+  function refreshFromEvent(e){
+    var detail = (e && e.detail) || {};
+
+    // Re-pull nav
+    apexCall('TODO_GET_NAV')
+      .then(function(data){
+        setNav((data && data.items) || []);
+      })
+      .catch(console.error);
+
+    // Re-pull tasks; if a new list was created, switch to it after data arrives
+    apexCall('TODO_GET_TASKS')
+      .then(function(data){
+        var r = (data && data.rows) || [];
+        r.forEach(function(t){ t.due = t.due ? new Date(t.due) : null; });
+        setRows(r);
+
+        if (detail.newListId) {
+          setActive(String(detail.newListId));           // flip UI to the new list
+          window.__pf_todo_active_key__ = String(detail.newListId); // optional: expose current key
+          if (window.apex && apex.item) {                // keep session in sync for stability
+            apex.item('P50_LIST_ID').setValue(String(detail.newListId));
+            apex.item('P50_VL').setValue('');
+          }
+        }
+      })
+      .catch(console.error);
+  }
+
+  // Listen to both jQuery-style and DOM CustomEvent
+var jqHandler = function(_evt, data){ 
+  refreshFromEvent({ detail: data }); 
+};
+try {
+  if (window.$ && $.fn && $(document).on) {
+    $(document).on('PF_TODO_DATA_CHANGED', jqHandler);
+  }
+} catch(_) {}
+
+
+  var domHandler = function(evt){ refreshFromEvent(evt); };
+  document.addEventListener('PF_TODO_DATA_CHANGED', domHandler);
+
+ return function cleanup(){
+  try {
+    if (window.$ && $.fn && $(document).off) {
+      $(document).off('PF_TODO_DATA_CHANGED', jqHandler);
+    }
+  } catch(_) {}
+  document.removeEventListener('PF_TODO_DATA_CHANGED', domHandler);
+};
+
+}, []);
+
+
+
+      function countForKey(k){ var it=nav.find(function(i){return String(i.key)===String(k);}); return it&&it.badge!=null?it.badge:null; }
+      var dueToday = rows.filter(function(t){ return t.due && sameDay(t.due, new Date()); }).length;
+      var overdue  = rows.filter(function(t){ return t.due && t.due < new Date() && t.status!=='DONE'; }).length;
+      var openCt   = rows.filter(function(t){ return t.status!=='DONE'; }).length;
+      var doneCt   = rows.filter(function(t){ return t.status==='DONE'; }).length;
+
+      return html`<div class="pf-wrap">
+        <div class="pf-header">
+          <div class="pf-title"><span>To‑Do Lists</span><span class="pf-chip">TB_ACTIVITIES</span></div>
+
+<div>
+  <button type="button" class="pf-btn" id="pf-todo-digest">🔔 Digest</button>
+  <button type="button" class="pf-btn" id="pf-todo-new-list"  style="margin-left:6px">＋ New list</button>
+  <button type="button" class="pf-btn primary" id="pf-todo-new-task" style="margin-left:6px">＋ New task</button>
+</div>
+
+ 
+        
+        </div>
+        <div class="pf-grid">
+          <div class="pf-card"><div class="pf-card-section"><div class="pf-list">
+            ${nav.length===0?html`<div style="color:var(--pf-muted);font-size:12px">Loading…</div>`:
+              nav.map(function(i){
+                if(i.divider) return html`<div class="pf-divider"></div>`;
+                var act=(String(active)===String(i.key))?' active':'';
+                var badge=countForKey(i.key);
+                return html`<div class=${'pf-list-item'+act} onClick=${function(){ setActive(String(i.key)); }}>
+                  <span>${iconMap[i.icon]||''}</span>
+                  <span>${i.label||''}</span>
+                  ${badge?html`<span class="pf-badge">${badge}</span>`:null}
+                </div>`;
+              })
+            }
+          </div></div></div>
+
+          <div>
+            <div class="pf-slicers">
+              ${Slicer({title:'Due Today', value:dueToday, icon:'📅'})}
+              ${Slicer({title:'Overdue', value:overdue, icon:'⚑'})}
+              ${Slicer({title:'Open', value:openCt, icon:'◯'})}
+              ${Slicer({title:'Done', value:doneCt, icon:'✓'})}
+            </div>
+
+            <div class="pf-card" style="margin-top:10px"><div class="pf-card-section pf-toolbar">
+              <input class="pf-input" placeholder="Search title, description…" value=${search} onInput=${function(e){ setSearch(e.currentTarget.value); }} />
+              <button class="pf-btn">Filters</button>
+              <button class="pf-btn">Sort</button>
+              <button class="pf-btn">Quick add</button>
+            </div></div>
+
+            <div class="pf-tasks">
+              ${rows.length===0?html`<div class="pf-card-section" style="color:var(--pf-muted)">No tasks match your filters.</div>` :
+                rows.map(function(t){
+                  return html`<div class="pf-task"><div class="pf-task-line">
+                    ${PriorityDot(t.priority)}
+                    <div style="flex:1">
+                      <div><span class="pf-title-click" onClick=${function(){ var n=Object.assign({},expanded); n[t.id]=!expanded[t.id]; setExpanded(n); }}>${t.title}</span></div>
+                      ${expanded[t.id]?html`<div class="pf-task-details">
+                        <div>${t.description||''}</div>
+                        <div class="pf-actions">
+                          ${t.projectId?html`<span class="pf-pill">📁 ${t.projectId}</span>`:null}
+                          <span class="pf-pill">👤 ${t.assignee||''}</span>
+                          ${t.due?html`<span class="pf-pill">📅 ${t.due.toLocaleDateString()}</span>`:null}
+                          <button class="pf-btn" onClick=${function(){
+                            setItem('P50_TASK_ID', t.id);
+                            apexCall('TODO_COMPLETE').then(function(){
+                              return Promise.all([apexCall('TODO_GET_NAV'), apexCall('TODO_GET_TASKS')]);
+                            }).then(function(res){
+                              setNav((res[0]&&res[0].items)||[]);
+                              var r=(res[1]&&res[1].rows)||[]; r.forEach(function(x){ x.due=x.due?new Date(x.due):null; }); setRows(r);
+                            }).catch(console.error);
+                          }}>Mark done</button>
+                          
+                          
+                     <button type="button" class="pf-btn" onClick=${function(){
+  setItem('P150_TASK_ID', t.id);
+  try{ apex.event.trigger(document, 'PF_EDIT_TASK', { id:String(t.id) }); }catch(e){}
+}}>Edit</button>
+
+
+
+
+
+                        </div>
+                      </div>`:null}
+                    </div>
+                    <div class="pf-meta">
+                      ${t.projectId?html`<span>📁 ${t.projectId}</span>`:null}
+                      <span>👤 ${t.assignee||''}</span>
+                      ${t.due?html`<span>📅 ${t.due.toLocaleDateString()}</span>`:null}
+                      <span>💬 ${t.comments||0}</span>
+                    </div>
+                  </div></div>`;
+                })
+              }
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+    return { App: App };
+  }
+
+
+
+// ---- PortfoliON To-Do: direct bindings (no reload, no submit)
+(function bindTodoInline(){
+  if (window.__pf_todo_inline__) return; window.__pf_todo_inline__ = true;
+
+  function $v(n){ return (window.apex && apex.item && apex.item(n)) ? apex.item(n).getValue() : ''; }
+  function setIf(p, v){ if (window.apex && apex.item && apex.item(p)) { apex.item(p).setValue(v); } }
+
+  // Broadcast a refresh signal (both jQuery and DOM CustomEvent)
+  function signalDataChanged(detail){
+    try { apex.event.trigger(document, 'PF_TODO_DATA_CHANGED', detail||{}); } catch(_){}
+    try { document.dispatchEvent(new CustomEvent('PF_TODO_DATA_CHANGED', { detail: detail||{} })); } catch(_){}
+  }
+
+  document.addEventListener('click', function(e){
+    // + New task
+    if (e.target.closest && e.target.closest('#pf-todo-new-task')){
+      e.preventDefault(); e.stopPropagation();
+
+      var title = window.prompt('Task name:');
+      if (!title) return;
+
+      // Preserve current context (so even if anything else refreshes, we restore the same view)
+      var currentListId = $v('P50_LIST_ID');
+      var listId = null;
+
+      if (/^\d+$/.test(currentListId)){
+        listId = Number(currentListId);
+      } else {
+        var add = window.confirm('Add to an existing list? (Cancel = put into Unsorted)');
+        if (add){
+          var other = window.prompt('Enter List ID (leave blank to keep Unsorted):','');
+          if (other && other.trim() !== '') listId = Number(other);
+        }
+      }
+
+      // Mirror current view to session (stable on any UI refresh)
+      setIf('P50_VL', (/^\d+$/.test(String(listId||'')) ? '' : ($v('P50_VL') || 'MYDAY')));
+      setIf('P50_LIST_ID', (listId!=null ? String(listId) : ''));
+
+      apex.server.process('TODO_CREATE', {
+        f01: [ JSON.stringify({ name: title, listId: listId }) ],
+        pageItems: '#P0_TENANCY_ID,#P0_PERSON_ID'
+      }, { dataType: 'json' })
+      .then(function(){ signalDataChanged({ type:'taskCreated' }); })
+      .catch(function(err){ console.error(err); apex.message?.alert?.('Could not create task'); });
+
+      return;
+    }
+
+    // + New list
+ // + New list
+if (e.target.closest && e.target.closest('#pf-todo-new-list')){
+  e.preventDefault(); e.stopPropagation();
+
+  var name = window.prompt('New list name:');
+  if (!name) return;
+
+  apex.server.process('TODO_CREATE_LIST', {
+    x01: name,
+    x02: $v('P0_PROJECT_ID'),
+    x03: $v('P0_TENANCY_ID'),
+    x04: $v('P0_PERSON_ID')
+  }, { dataType: 'json' })
+  .then(function(res){
+    // Expect JSON like  {"list_id":1234}
+    var newId = res && res.list_id ? String(res.list_id) : null;
+
+    // Update APEX session + local state to that new list
+    if (newId){
+      if (window.apex && apex.item){
+        apex.item('P50_LIST_ID').setValue(newId);
+        apex.item('P50_VL').setValue(''); // clear virtual view
+      }
+      // remember active key globally so component uses it on next render
+      window.__pf_todo_active_key__ = newId;
+
+      // Notify the running component to refresh & switch view
+      apex.event.trigger(document, 'PF_TODO_DATA_CHANGED', {
+        type: 'listCreated',
+        newListId: newId
+      });
+    } else {
+      // no id returned → just refresh normally
+      apex.event.trigger(document, 'PF_TODO_DATA_CHANGED', { type: 'listCreated' });
+    }
+  })
+  .catch(function(err){
+    console.error(err);
+    apex.message?.alert?.('Could not create list');
+  });
+
+  return;
+}
+
+
+
+
+
+
+  }, true);
+})();
+
+
+
+
+
+
+  function mount(containerId, options){
+    injectCSS();
+    var root=document.getElementById(containerId);
+    var C=createApp().App;
+    preact.render(preact.h(C, options||{}), root);
+  }
+
+  window.PortfolionTodo = {
+    mount: function(containerId, options){
+      ensureLibs().then(function(){ mount(containerId, options); });
+    }
+  };
+})();
