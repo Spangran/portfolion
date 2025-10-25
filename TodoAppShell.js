@@ -1,9 +1,9 @@
-/* PortfoliON – TODO App Shell (UMD)  v2.0
- * Uses PortfolionListNav + PortfolionListAdmin. No embedded nav/admin code.
+/* PortfoliON – TODO App Shell (UMD)  v2.1
+ * Uses PortfolionListNav + PortfolionListAdmin.
+ * Adds: visual "Show Done" toggle, wires favourites + list creation via APEX.
  * Mount with: PortfolionTodoAppV2.mount('todo-root')
  */
 (function (global){
-  const ICONS={};
   const CSS = `
   .pta { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color:#111827; }
   .pta .grid { display:grid; grid-template-columns: 300px 1fr; gap:16px; height: calc(100vh - 220px); }
@@ -14,10 +14,12 @@
   .pta .input { border:1px solid #e5e7eb; border-radius:10px; padding:7px 10px; min-width:240px; outline:none; }
   .pta .btn { border:1px solid #e5e7eb; border-radius:10px; background:#fff; padding:6px 10px; cursor:pointer; }
   .pta .btn.primary { border-color:#4f46e5; background:#4f46e5; color:#fff; }
+  .pta .toggle { border:1px solid #e5e7eb; border-radius:999px; padding:6px 10px; cursor:pointer; }
+  .pta .toggle.active { background:#eef2ff; border-color:#6366f1; color:#3730a3; }
   .pta .slicers { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px; margin-bottom:10px; }
   .pta .slicer { background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:10px; display:flex; align-items:center; gap:10px }
   .pta .slicer .val { font-size:20px; font-weight:700 }
-  .pta .task { border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fff; }
+  .pta .task { border:1px solid #e5e7eb; border-radius:12px; padding:12px; background:#fff; transition:opacity .15s ease; }
   .pta .task + .task { margin-top:8px; }
   .pta .meta { display:flex; gap:10px; align-items:center; color:#475569; font-size:12px; }
   .pta .title-link{ cursor:pointer; text-decoration:underline; text-decoration-color:#e5e7eb }
@@ -28,7 +30,7 @@
   /* compact scale */
   .pta { --scale:.85; }
   .pta .input { padding: calc(7px*var(--scale)) calc(10px*var(--scale)); min-width: calc(240px*var(--scale)); }
-  .pta .btn { padding: calc(6px*var(--scale)) calc(10px*var(--scale)); font-size: calc(13px*var(--scale)); }
+  .pta .btn, .pta .toggle { padding: calc(6px*var(--scale)) calc(10px*var(--scale)); font-size: calc(13px*var(--scale)); }
   `;
   function ensureCSS(){ if (!document.getElementById('pta-css')) document.head.appendChild(el('style',{id:'pta-css'}, CSS)); }
   function el(tag, props, ...kids){
@@ -67,7 +69,7 @@
           el('div', {class:'card'}, el('div', {class:'section toolbar'},
             this.search = el('input', {class:'input', placeholder:'Search title, description…', value:this.state.search, oninput:(e)=>{ this.state.search=e.target.value; this.renderTasks(); }}),
             el('button', {type:'button', class:'btn', onclick:()=>this.quickAdd()}, 'Quick add'),
-            el('button', {type:'button', class:'btn', onclick:()=>this.toggleDone()}, '☑ Show done')
+            this.toggleBtn = el('button', {type:'button', class:'toggle', 'aria-pressed':'false', onclick:()=>this.toggleDone()}, '☑ Show done')
           )),
           this.tasksWrap = el('div', {class:'section'})
         )
@@ -75,9 +77,11 @@
     );
     this.root.appendChild(this.wrap);
 
-    // Mount List Nav component
+    // Mount List Nav component with APEX adapters
     var NAV_API = {
-      getNav: ()=> apexCall('TODO_GET_NAV', { pageItems:'#P0_TENANCY_ID,#P0_PERSON_ID' })
+      getNav: ()=> apexCall('TODO_GET_NAV', { pageItems:'#P0_TENANCY_ID,#P0_PERSON_ID' }),
+      toggleFav: (listId, yn)=> apexCall('LIST_FAV_TOGGLE', { x01:String(listId), x02:String(yn) }),
+      createList: (payload)=> apexCall('LIST_ADMIN', { x01:'CREATE', x03: payload.name, x04: (payload.project_id!=null? String(payload.project_id): null) })
     };
     PortfolionListNav.mount(this.left, {
       api: NAV_API,
@@ -96,28 +100,43 @@
         this.refresh();
       },
       onOpenAdmin: (listItem)=> {
+        if (!global.PortfolionListAdmin || !PortfolionListAdmin.openApex){
+          if (window.console) console.warn('PortfolionListAdmin not loaded');
+          return;
+        }
         PortfolionListAdmin.openApex({
           listId: listItem.key,
           onChanged: ()=> { this.refreshNavOnly(); this.refresh(); }
         });
+      },
+      onCreated: (newId)=> {
+        setItem('P50_LIST_ID', String(newId));
+        setItem('P50_VL', '');
+        this.refresh();
       }
     });
 
-    // Events: refresh on data changed
-    document.addEventListener('PF_TODO_DATA_CHANGED', ()=> this.refresh());
-    if (window.$ && $.fn) $(document).on('PF_TODO_DATA_CHANGED', ()=> this.refresh());
-
+    // Initial toggle state
+    this.syncToggleUI();
     this.refresh();
   };
 
+  App.prototype.syncToggleUI = function(){
+    var on = ($v('P50_SHOW_DONE') || 'N') === 'Y';
+    this.toggleBtn.classList.toggle('active', on);
+    this.toggleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    this.toggleBtn.textContent = on ? '☑ Show done' : '☐ Hide done';
+  };
+
   App.prototype.refreshNavOnly = function(){
-    // If you keep an instance handle to the nav, call .load() here. For simplicity we rely on its internal refresh
-    apexCall('TODO_GET_NAV', { pageItems:'#P0_TENANCY_ID,#P0_PERSON_ID' }).then(()=>{});
+    // Nav component refreshes itself via load() after actions; nothing extra needed here.
+    return;
   };
 
   App.prototype.toggleDone = function(){
     var cur = ($v('P50_SHOW_DONE') || 'N');
     setItem('P50_SHOW_DONE', cur==='Y' ? 'N' : 'Y');
+    this.syncToggleUI();
     this.refresh();
   };
 
@@ -160,7 +179,7 @@
     var frag=document.createDocumentFragment();
     if (filtered.length===0) frag.appendChild(el('div', {class:'section', style:'color:#64748b'}, 'No tasks match your filters.'));
     filtered.forEach(t=>{
-      var row = el('div', {class:'task'+(t.status_txt==='DONE'?' done':'')},
+      var row = el('div', {class:'task'+(t.status_txt==='DONE'?' done':''), style:'opacity:1'},
         el('div', {},
           el('span', {class:'title-link', onclick:()=> this.toggleExpand(t.id)}, t.title||'(untitled)')
         ),
@@ -191,7 +210,6 @@
       .then(()=> this.refresh());
   };
   App.prototype.editTask = function(taskId){
-    // Leave as-is: trigger your existing DA/modal
     if (window.apex && apex.event) apex.event.trigger(document, 'PF_EDIT_TASK', { id:String(taskId) });
   };
 
